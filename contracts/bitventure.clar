@@ -185,3 +185,58 @@
       })))
   )
 )
+
+;; Place bid on auction
+(define-public (place-bid (product-id uint) (bid-amount uint))
+  (let
+    ((product (unwrap! (map-get? Products product-id) (err err-listing-not-found)))
+     (auction (unwrap! (map-get? Auctions product-id) (err err-no-active-auction))))
+    
+    (asserts! (get is-active auction) (err err-auction-ended))
+    (asserts! (<= stacks-block-height (get end-block auction)) (err err-auction-ended))
+    (asserts! (>= bid-amount (get min-price auction)) (err err-bid-too-low))
+    (asserts! (> bid-amount (get highest-bid auction)) (err err-bid-too-low))
+    
+    (if (>= (stx-get-balance tx-sender) bid-amount)
+      (begin
+        ;; Return funds to previous bidder if exists
+        (match (get highest-bidder auction)
+          prev-bidder (try! (stx-transfer? (get highest-bid auction) contract-owner prev-bidder))
+          true)
+        ;; Accept new bid
+        (try! (stx-transfer? bid-amount tx-sender contract-owner))
+        (ok (map-set Auctions product-id
+          (merge auction {
+            highest-bid: bid-amount,
+            highest-bidder: (some tx-sender)
+          }))))
+      (err err-insufficient-funds))
+  )
+)
+
+;; End auction
+(define-public (end-auction (product-id uint))
+  (let
+    ((product (unwrap! (map-get? Products product-id) (err err-listing-not-found)))
+     (auction (unwrap! (map-get? Auctions product-id) (err err-no-active-auction)))
+     (brand (get brand product)))
+    
+    (asserts! (get is-active auction) (err err-auction-ended))
+    (asserts! (>= stacks-block-height (get end-block auction)) (err err-auction-ended))
+    
+    (match (get highest-bidder auction)
+      winner (begin
+        (let ((bid-amount (get highest-bid auction))
+              (fee (/ (* bid-amount (var-get platform-fee)) u1000)))
+          ;; Transfer funds
+          (try! (stx-transfer? fee contract-owner contract-owner))
+          (try! (stx-transfer? (- bid-amount fee) contract-owner brand))
+          ;; Update product status
+          (try! (map-set Products product-id 
+            (merge product {available: false})))
+          ;; Close auction
+          (ok (map-set Auctions product-id
+            (merge auction {is-active: false})))))
+      (err err-no-active-auction))
+  )
+)
