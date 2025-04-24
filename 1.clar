@@ -26,7 +26,6 @@
 (define-constant err-no-active-auction (err u107))
 (define-constant err-invalid-duration (err u108))
 (define-constant err-invalid-rating (err u109))
-(define-constant err-transfer-failed (err u110))
 
 ;; Data Variables
 (define-data-var platform-fee uint u25) ;; 2.5% fee
@@ -139,16 +138,12 @@
           (get available product)
           (not (get is-auction product))
           (>= (stx-get-balance tx-sender) price))
-      (let
-        ((fee-transfer-result (stx-transfer? fee tx-sender contract-owner))
-         (payment-transfer-result (stx-transfer? (- price fee) tx-sender brand)))
-        
-        (if (and 
-              (is-ok fee-transfer-result)
-              (is-ok payment-transfer-result))
-          (ok (map-set Products product-id 
-                (merge product {available: false})))
-          (err err-transfer-failed)))
+      (begin
+        (try! (stx-transfer? fee tx-sender contract-owner))
+        (try! (stx-transfer? (- price fee) tx-sender brand))
+        (map-set Products product-id 
+          (merge product {available: false}))
+        (ok true))
       (err err-insufficient-funds))
   )
 )
@@ -167,28 +162,27 @@
      (product-id (+ (var-get product-counter) u1))
      (end-block (+ stacks-block-height duration)))
     
-    (if (and (>= duration u10) (> min-price u0))
-      (begin
-        (var-set product-counter product-id)
-        (map-set Products product-id {
-          brand: tx-sender,
-          name: name,
-          description: description,
-          price: min-price,
-          available: true,
-          created-at: stacks-block-height,
-          is-auction: true
-        })
-        (ok (map-set Auctions product-id {
-          end-block: end-block,
-          min-price: min-price,
-          highest-bid: u0,
-          highest-bidder: none,
-          is-active: true
-        })))
-      (if (< duration u10)
-        (err err-invalid-duration)
-        (err err-invalid-price)))
+    (asserts! (>= duration u10) (err err-invalid-duration))
+    (asserts! (> min-price u0) (err err-invalid-price))
+
+    (begin
+      (var-set product-counter product-id)
+      (try! (map-set Products product-id {
+        brand: tx-sender,
+        name: name,
+        description: description,
+        price: min-price,
+        available: true,
+        created-at: stacks-block-height,
+        is-auction: true
+      }))
+      (ok (map-set Auctions product-id {
+        end-block: end-block,
+        min-price: min-price,
+        highest-bid: u0,
+        highest-bidder: none,
+        is-active: true
+      })))
   )
 )
 
@@ -198,35 +192,25 @@
     ((product (unwrap! (map-get? Products product-id) (err err-listing-not-found)))
      (auction (unwrap! (map-get? Auctions product-id) (err err-no-active-auction))))
     
-    (if (and 
-          (get is-active auction)
-          (<= stacks-block-height (get end-block auction))
-          (>= bid-amount (get min-price auction))
-          (> bid-amount (get highest-bid auction))
-          (>= (stx-get-balance tx-sender) bid-amount))
-      (let
-        ((return-result (match (get highest-bidder auction)
-          prev-bidder (stx-transfer? (get highest-bid auction) contract-owner prev-bidder)
-          (ok true)))
-         (bid-result (stx-transfer? bid-amount tx-sender contract-owner)))
-        
-        (if (and (is-ok return-result) (is-ok bid-result))
-          (ok (map-set Auctions product-id
-            (merge auction {
-              highest-bid: bid-amount,
-              highest-bidder: (some tx-sender)
-            })))
-          (err err-transfer-failed)))
-      ;; Replace cond with nested if statements
-      (if (not (get is-active auction))
-        (err err-auction-ended)
-        (if (> stacks-block-height (get end-block auction))
-          (err err-auction-ended)
-          (if (< bid-amount (get min-price auction))
-            (err err-bid-too-low)
-            (if (<= bid-amount (get highest-bid auction))
-              (err err-bid-too-low)
-              (err err-insufficient-funds))))))
+    (asserts! (get is-active auction) (err err-auction-ended))
+    (asserts! (<= stacks-block-height (get end-block auction)) (err err-auction-ended))
+    (asserts! (>= bid-amount (get min-price auction)) (err err-bid-too-low))
+    (asserts! (> bid-amount (get highest-bid auction)) (err err-bid-too-low))
+    
+    (if (>= (stx-get-balance tx-sender) bid-amount)
+      (begin
+        ;; Return funds to previous bidder if exists
+        (match (get highest-bidder auction)
+          prev-bidder (try! (stx-transfer? (get highest-bid auction) contract-owner prev-bidder))
+          true)
+        ;; Accept new bid
+        (try! (stx-transfer? bid-amount tx-sender contract-owner))
+        (ok (map-set Auctions product-id
+          (merge auction {
+            highest-bid: bid-amount,
+            highest-bidder: (some tx-sender)
+          }))))
+      (err err-insufficient-funds))
   )
 )
 
@@ -237,24 +221,23 @@
      (auction (unwrap! (map-get? Auctions product-id) (err err-no-active-auction)))
      (brand (get brand product)))
     
-    (if (and 
-          (get is-active auction)
-          (>= stacks-block-height (get end-block auction)))
-      (match (get highest-bidder auction)
-        winner 
-          (let ((bid-amount (get highest-bid auction))
-                (fee (/ (* bid-amount (var-get platform-fee)) u1000))
-                (fee-transfer (stx-transfer? fee contract-owner contract-owner))
-                (payment-transfer (stx-transfer? (- bid-amount fee) contract-owner brand)))
-            (if (and (is-ok fee-transfer) (is-ok payment-transfer))
-              (begin
-                (map-set Products product-id (merge product {available: false}))
-                (ok (map-set Auctions product-id (merge auction {is-active: false}))))
-              (err err-transfer-failed)))
-        (err err-no-active-auction))
-      (if (not (get is-active auction))
-        (err err-auction-ended)
-        (err err-auction-ended)))
+    (asserts! (get is-active auction) (err err-auction-ended))
+    (asserts! (>= stacks-block-height (get end-block auction)) (err err-auction-ended))
+    
+    (match (get highest-bidder auction)
+      winner (begin
+        (let ((bid-amount (get highest-bid auction))
+              (fee (/ (* bid-amount (var-get platform-fee)) u1000)))
+          ;; Transfer funds
+          (try! (stx-transfer? fee contract-owner contract-owner))
+          (try! (stx-transfer? (- bid-amount fee) contract-owner brand))
+          ;; Update product status
+          (try! (map-set Products product-id 
+            (merge product {available: false})))
+          ;; Close auction
+          (ok (map-set Auctions product-id
+            (merge auction {is-active: false})))))
+      (err err-no-active-auction))
   )
 )
 
@@ -268,15 +251,14 @@
   (let
     ((product (unwrap! (map-get? Products product-id) 
               (err err-listing-not-found))))
-    (if (<= rating u5)
-      (ok (map-set Reviews 
-        {product-id: product-id, reviewer: tx-sender}
-        {
-          rating: rating,
-          comment: comment,
-          timestamp: stacks-block-height
-        }))
-      (err err-invalid-rating))
+    (asserts! (<= rating u5) (err err-invalid-rating))
+    (ok (map-set Reviews 
+      {product-id: product-id, reviewer: tx-sender}
+      {
+        rating: rating,
+        comment: comment,
+        timestamp: stacks-block-height
+      }))
   )
 )
 
